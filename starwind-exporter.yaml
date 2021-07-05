@@ -1,0 +1,7 @@
+servers:
+  - host: localhost:3261
+    username: bannanas
+    password: starwind
+  - host: 127.0.0.1:3261
+    username: root
+    password: starwind

@@ -22,6 +22,7 @@ import (
 	"github.com/prometheus/exporter-toolkit/web"
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -174,17 +175,35 @@ type Exporter struct {
 }
 
 type Config struct {
-	Username string
-	Password string
-	Host     string
+	Servers []*Server `yaml:"servers"`
 }
 
-func (c *Config) NewExporter(uri string, timeout time.Duration, logger log.Logger) (*Exporter, error) {
+type Server struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	Host     string `yaml:"host"`
+	Registry *prometheus.Registry
+}
+
+func NewConfig() *Config {
+	return &Config{
+		Servers: []*Server{
+			{
+				Username: "root",
+				Password: "starwind",
+				Host:     "localhost:3261",
+				Registry: prometheus.NewRegistry(),
+			},
+		},
+	}
+}
+
+func (s *Server) NewExporter(timeout time.Duration, logger log.Logger) (*Exporter, error) {
 	var fetchStat func() (*Devices, error)
-	fetchStat, _ = fetchTCP(uri, timeout, c)
+	fetchStat, _ = fetchTCP(s.Host, timeout, s)
 
 	return &Exporter{
-		URI:       uri,
+		URI:       s.Host,
 		fetchStat: fetchStat,
 		up: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
@@ -222,6 +241,8 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (e *Exporter) scrape(ch chan<- prometheus.Metric) (up float64) {
+
+	level.Info(e.logger).Log("msg", fmt.Sprintf("Starting scrape of %s now", e.URI))
 	e.totalScrapes.Inc()
 	var err error
 
@@ -326,12 +347,13 @@ func (e *Exporter) parseHAMetrics(metrics map[int]metricInfo, devices *Devices, 
 	}
 }
 
-func fetchTCP(uri string, timeout time.Duration, config *Config) (func() (*Devices, error), error) {
+func fetchTCP(uri string, timeout time.Duration, server *Server) (func() (*Devices, error), error) {
 	return func() (*Devices, error) {
 		conn, err := dialTCP(uri, timeout)
 		if err != nil {
 			return nil, err
 		}
+		defer conn.Close()
 
 		scanner := bufio.NewScanner(conn)
 
@@ -340,15 +362,15 @@ func fetchTCP(uri string, timeout time.Duration, config *Config) (func() (*Devic
 			return nil, err
 		}
 		if err := checkSuccess(scanner); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("Error setting protocol version")
 		}
 
 		// Login
-		if _, err := fmt.Fprintf(conn, "%s %s %s\n", "login", config.Username, config.Password); err != nil {
+		if _, err := fmt.Fprintf(conn, "%s %s %s\n", "login", server.Username, server.Password); err != nil {
 			return nil, err
 		}
 		if err := checkSuccess(scanner); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("Error authenticating")
 		}
 
 		// Get all metrics
@@ -356,7 +378,7 @@ func fetchTCP(uri string, timeout time.Duration, config *Config) (func() (*Devic
 			return nil, err
 		}
 		if err := checkSuccess(scanner); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("Error getting metrics")
 		}
 
 		var id int
@@ -405,15 +427,20 @@ type Devices []*Device
 
 func checkSuccess(scanner *bufio.Scanner) error {
 	success_regex := regexp.MustCompile("200 Completed")
-	timer := time.NewTimer(2 * time.Second)
-	for scanner.Scan() {
+	timer := time.NewTimer(60 * time.Second)
+	for {
+		if ok := scanner.Scan(); !ok {
+			break
+		}
+
 		match := success_regex.FindSubmatch(scanner.Bytes())
 		if match != nil {
 			return nil
 		}
+
 		select {
 		case <-timer.C:
-			break
+			return fmt.Errorf("Timeout waiting for success")
 		default:
 		}
 	}
@@ -421,6 +448,7 @@ func checkSuccess(scanner *bufio.Scanner) error {
 }
 
 func dialTCP(uri string, timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
 	dialer := &net.Dialer{}
 	targetAddress, port, err := net.SplitHostPort(uri)
 	if err != nil {
@@ -437,12 +465,14 @@ func dialTCP(uri string, timeout time.Duration) (net.Conn, error) {
 	}
 
 	dialTarget := net.JoinHostPort(ip.String(), port)
-	dialer.Deadline = time.Now().Add(timeout)
+	dialer.Deadline = deadline
 
 	conn, err := dialer.Dial("tcp", dialTarget)
 	if err != nil {
 		return nil, err
 	}
+	conn.SetDeadline(deadline)
+	conn.SetReadDeadline(deadline)
 	return conn, nil
 }
 
@@ -466,13 +496,33 @@ func lookup(uri string) (*net.IPAddr, error) {
 	return ip, nil
 }
 
+func handleProbe(w http.ResponseWriter, r *http.Request, c *Config) {
+	serverName := r.URL.Query().Get("server")
+	if serverName == "" {
+		http.Error(w, fmt.Sprintf("Module not defined"), http.StatusBadRequest)
+		return
+	}
+
+	for _, s := range c.Servers {
+		if s.Host == serverName {
+			handler := promhttp.HandlerFor(s.Registry, promhttp.HandlerOpts{})
+			handler.ServeHTTP(w, r)
+			return
+		}
+	}
+
+	http.Error(w, fmt.Sprintf("No module found"), http.StatusBadRequest)
+	return
+}
+
 func main() {
 	var (
-		webConfig         = webflag.AddFlags(kingpin.CommandLine)
-		listenAddress     = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9101").String()
-		metricsPath       = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
-		starwindScrapeURI = kingpin.Flag("starwind.scrape-uri", "URI on which to scrape Starwind.").Default("127.0.0.1:3261").String()
-		starwindTimeout   = kingpin.Flag("starwind.timeout", "Timeout for trying to get stats from Starwind.").Default("5s").Duration()
+		webConfig       = webflag.AddFlags(kingpin.CommandLine)
+		listenAddress   = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9101").String()
+		metricsPath     = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		probePath       = kingpin.Flag("web.probe-path", "Path under which to expose metrics.").Default("/probe").String()
+		starwindTimeout = kingpin.Flag("starwind.timeout", "Timeout for trying to get stats from Starwind.").Default("5s").Duration()
+		configFile      = kingpin.Flag("config.file", "TFilepath for configuration.").Default("").String()
 	)
 
 	promlogConfig := &promlog.Config{}
@@ -485,20 +535,44 @@ func main() {
 	level.Info(logger).Log("msg", "Starting starwind_exporter", "version", version.Info())
 	level.Info(logger).Log("msg", "Build context", "context", version.BuildContext())
 
-	c := Config{
-		Username: "root",
-		Password: "starwind",
+	c := NewConfig()
+	if *configFile != "" {
+		yamlReader, err := os.Open(*configFile)
+		if err != nil {
+			level.Error(logger).Log("msg", "Error reading config", "err", err)
+			os.Exit(1)
+		}
+		defer yamlReader.Close()
+		decoder := yaml.NewDecoder(yamlReader)
+		decoder.KnownFields(true)
+		if err = decoder.Decode(c); err != nil {
+			level.Error(logger).Log("msg", "Error decoding config", "err", err)
+			os.Exit(1)
+		}
+
+		for _, server := range c.Servers {
+			server.Registry = prometheus.NewRegistry()
+		}
 	}
-	exporter, err := c.NewExporter(*starwindScrapeURI, *starwindTimeout, logger)
-	if err != nil {
-		level.Error(logger).Log("msg", "Error creating an exporter", "err", err)
-		os.Exit(1)
+
+	// Create a new exporter for every host in config file
+	for _, server := range c.Servers {
+		e, err := server.NewExporter(*starwindTimeout, logger)
+		if err != nil {
+			level.Error(logger).Log("msg", fmt.Sprintf("Error creating an exporter for %s", server.Host), "err", err)
+			os.Exit(1)
+		}
+		server.Registry.MustRegister(e)
+		server.Registry.MustRegister(version.NewCollector("starwind_exporter"))
 	}
-	prometheus.MustRegister(exporter)
-	prometheus.MustRegister(version.NewCollector("starwind_exporter"))
 
 	level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
+
 	http.Handle(*metricsPath, promhttp.Handler())
+	http.Handle(*probePath, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleProbe(w, r, c)
+	}))
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
              <head><title>Starwind Exporter</title></head>
@@ -514,3 +588,5 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+type Registries []*prometheus.Registry

@@ -8,4 +8,5 @@ require (
 	github.com/prometheus/common v0.29.0
 	github.com/prometheus/exporter-toolkit v0.6.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
+	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b
 )
