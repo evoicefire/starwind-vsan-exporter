@@ -518,7 +518,7 @@ func handleProbe(w http.ResponseWriter, r *http.Request, c *Config) {
 func main() {
 	var (
 		webConfig       = webflag.AddFlags(kingpin.CommandLine)
-		listenAddress   = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9101").String()
+		listenAddress   = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry. Default 9852").Default(":9852").String()
 		metricsPath     = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
 		probePath       = kingpin.Flag("web.probe-path", "Path under which to expose metrics.").Default("/probe").String()
 		starwindTimeout = kingpin.Flag("starwind.timeout", "Timeout for trying to get stats from Starwind.").Default("5s").Duration()
